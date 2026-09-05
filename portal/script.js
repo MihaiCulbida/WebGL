@@ -1,17 +1,37 @@
 import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
-/* ---------- config ---------- */
 const FINGER_TIP = { thumb: 4, index: 8 };
-const PORTAL_COLOR = "#00ff66";     // contur + puncte
+const PORTAL_COLOR = "#00ff66";
 
-/* ---------- dom ---------- */
+const PINCH_RATIO_THRESHOLD = 0.40;
+const CHARGE_DURATION_MS = 1600;
+const RESET_HOLD_MS = 2000;
+const POP_DURATION_MS = 450;
+
+const FINGER_JOINTS = {
+    index:  { tip: 8,  pip: 6  },
+    middle: { tip: 12, pip: 10 },
+    ring:   { tip: 16, pip: 14 },
+    pinky:  { tip: 20, pip: 18 }
+};
+
 const video = document.getElementById('camera');
 const canvas = document.getElementById('overlay');
 const ctx = canvas.getContext('2d');
 
 let handLandmarker = null;
 
-/* ---------- init ---------- */
+let mode = 'normal';
+
+let chargeActive = false;
+let chargeStartTime = 0;
+let chargeProgress = 0;
+let chargeReady = false;
+
+let resetHoldStart = 0;
+
+let pop = null;
+
 async function init() {
     const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
@@ -36,42 +56,175 @@ async function init() {
     requestAnimationFrame(loop);
 }
 
-/* ---------- main loop ---------- */
 function loop() {
-    const results = handLandmarker.detectForVideo(video, performance.now());
+    const now = performance.now();
+    const results = handLandmarker.detectForVideo(video, now);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const quad = extractQuadPoints(results);
-
-    if (quad) {
-        drawPortal(quad);
-        drawFingerMarkers(quad);
-    }
+    if (!pop) handleReset(results, now);
+    renderMode(results, now);
+    if (pop) renderPop(now);
 
     requestAnimationFrame(loop);
 }
 
-/* ---------- extract 4 fixed-order points (2 per hand) ---------- */
-function extractQuadPoints(results) {
-    if (!results.landmarks || results.landmarks.length < 2) return null;
+function renderMode(results, now) {
+    if (mode === 'fullscreen') {
+        drawFullscreenBackground();
+    }
+
+    const landmarks = results.landmarks || [];
+
+    if (landmarks.length === 2) {
+        const [handA, handB] = landmarks;
+        const pinchA = isPinch(handA);
+        const pinchB = isPinch(handB);
+
+        const quad = buildQuad(results);
+        if (quad) {
+            if (mode === 'fullscreen') drawInvertedPortal(quad);
+            else drawPortal(quad);
+            drawFingerMarkers(quad);
+        }
+
+        if (pinchA !== pinchB) {
+
+            if (!chargeActive) {
+                chargeActive = true;
+                chargeStartTime = now;
+            }
+            chargeProgress = clamp((now - chargeStartTime) / CHARGE_DURATION_MS, 0, 1);
+            if (chargeProgress >= 1) chargeReady = true;
+
+            const pinchHand = pinchA ? handA : handB;
+            drawChargeBar(pinchHand, chargeProgress);
+
+        } else if (!pinchA && !pinchB) {
+
+            if (chargeReady) {
+
+                const center = averageHandsCenter(handA, handB);
+                mode = (mode === 'fullscreen') ? 'normal' : 'fullscreen';
+                startPop(center);
+                resetCharge();
+            } else {
+                resetCharge();
+            }
+        } else {
+
+            resetCharge();
+        }
+    } else {
+        resetCharge();
+    }
+}
+
+function drawFullscreenBackground() {
+    ctx.filter = "grayscale(1) contrast(1.15)";
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.filter = "none";
+}
+
+function startPop(center) {
+    const PARTICLE_COUNT = 12;
+    const particles = Array.from({ length: PARTICLE_COUNT }, (_, i) => ({
+        angle: (i / PARTICLE_COUNT) * Math.PI * 2 + (Math.random() * 0.4 - 0.2),
+        distance: 70 + Math.random() * 50
+    }));
+    pop = { center, startTime: performance.now(), particles };
+}
+
+function renderPop(now) {
+    const progress = clamp((now - pop.startTime) / POP_DURATION_MS, 0, 1);
+    const easeOut = 1 - Math.pow(1 - progress, 3);
+    const fade = 1 - progress;
+
+    if (progress < 0.25) {
+        const flashAlpha = (1 - progress / 0.25) * 0.45;
+        ctx.fillStyle = `rgba(255,255,255,${flashAlpha})`;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    pop.particles.forEach(part => {
+        const d = easeOut * part.distance;
+        const x = pop.center.x + Math.cos(part.angle) * d;
+        const y = pop.center.y + Math.sin(part.angle) * d;
+        const size = 5 * fade;
+        if (size <= 0) return;
+        ctx.beginPath();
+        ctx.arc(x, y, size, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(0,255,102,${fade})`;
+        ctx.fill();
+    });
+
+    if (progress >= 1) pop = null;
+}
+
+function handleReset(results, now) {
+    const landmarks = results.landmarks || [];
+
+    if (landmarks.length === 1 && isHandOpen(landmarks[0])) {
+        if (resetHoldStart === 0) resetHoldStart = now;
+
+        if (now - resetHoldStart >= RESET_HOLD_MS) {
+            mode = 'normal';
+            resetCharge();
+            resetHoldStart = 0;
+        }
+    } else {
+        resetHoldStart = 0;
+    }
+}
+
+function resetCharge() {
+    chargeActive = false;
+    chargeProgress = 0;
+    chargeReady = false;
+}
+
+function dist(a, b) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function clamp(v, min, max) {
+    return Math.min(max, Math.max(min, v));
+}
+
+function isPinch(landmarks) {
+    const scale = dist(landmarks[0], landmarks[9]);
+    if (scale === 0) return false;
+    const pinchDist = dist(landmarks[FINGER_TIP.thumb], landmarks[FINGER_TIP.index]);
+    return (pinchDist / scale) < PINCH_RATIO_THRESHOLD;
+}
+
+function isHandOpen(landmarks) {
+    const wrist = landmarks[0];
+    let extended = 0;
+    for (const key in FINGER_JOINTS) {
+        const { tip, pip } = FINGER_JOINTS[key];
+        if (dist(wrist, landmarks[tip]) > dist(wrist, landmarks[pip]) * 1.1) {
+            extended++;
+        }
+    }
+    return extended >= 3;
+}
+
+function buildQuad(results) {
+    const landmarks = results.landmarks;
+    if (!landmarks || landmarks.length < 2) return null;
 
     const hands = { Left: null, Right: null };
-
-    results.landmarks.forEach((landmarks, i) => {
+    landmarks.forEach((lm, i) => {
         const label = results.handednesses?.[i]?.[0]?.categoryName || (i === 0 ? "Left" : "Right");
-        hands[label] = landmarks;
+        hands[label] = lm;
     });
-
     if (!hands.Left || !hands.Right) return null;
 
-    const toPoint = (landmarks, idx) => ({
-        x: landmarks[idx].x * canvas.width,
-        y: landmarks[idx].y * canvas.height
+    const toPoint = (lm, idx) => ({
+        x: lm[idx].x * canvas.width,
+        y: lm[idx].y * canvas.height
     });
 
-    // Ordine fixa (nu sortata dupa unghi) -> daca degetele unei maini isi
-    // schimba pozitia relativa, patrulaterul se auto-intersecteaza si
-    // devine vizual 2 triunghiuri, exact ca la un portal "rasucit".
     return [
         toPoint(hands.Left, FINGER_TIP.thumb),
         toPoint(hands.Left, FINGER_TIP.index),
@@ -80,19 +233,16 @@ function extractQuadPoints(results) {
     ];
 }
 
-/* ---------- portal (contur verde + interior alb-negru) ---------- */
+function averageHandsCenter(handA, handB) {
+    const pA = midpoint(toCanvasPoint(handA[FINGER_TIP.thumb]), toCanvasPoint(handA[FINGER_TIP.index]));
+    const pB = midpoint(toCanvasPoint(handB[FINGER_TIP.thumb]), toCanvasPoint(handB[FINGER_TIP.index]));
+    return midpoint(pA, pB);
+}
+
 function drawPortal(points) {
     ctx.save();
+    tracePolygon(points);
 
-    // path-ul patrulaterului (poate deveni bowtie / 2 triunghiuri)
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    ctx.lineTo(points[1].x, points[1].y);
-    ctx.lineTo(points[2].x, points[2].y);
-    ctx.lineTo(points[3].x, points[3].y);
-    ctx.closePath();
-
-    // --- interior: cadru video alb-negru ---
     ctx.save();
     ctx.clip();
     ctx.filter = "grayscale(1) contrast(1.15)";
@@ -100,15 +250,36 @@ function drawPortal(points) {
     ctx.filter = "none";
     ctx.restore();
 
-    // --- contur verde pe toata lungimea portalului ---
     ctx.lineWidth = 3;
     ctx.strokeStyle = PORTAL_COLOR;
     ctx.stroke();
-
     ctx.restore();
 }
 
-/* ---------- puncte la varfurile degetelor: alb cu contur verde ---------- */
+function drawInvertedPortal(points) {
+    ctx.save();
+    tracePolygon(points);
+
+    ctx.save();
+    ctx.clip();
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = PORTAL_COLOR;
+    ctx.stroke();
+    ctx.restore();
+}
+
+function tracePolygon(points) {
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x, points[i].y);
+    }
+    ctx.closePath();
+}
+
 function drawFingerMarkers(points) {
     points.forEach(p => {
         ctx.beginPath();
@@ -119,6 +290,43 @@ function drawFingerMarkers(points) {
         ctx.strokeStyle = PORTAL_COLOR;
         ctx.stroke();
     });
+}
+
+function drawChargeBar(pinchHand, progress) {
+    const p = midpoint(
+        toCanvasPoint(pinchHand[FINGER_TIP.thumb]),
+        toCanvasPoint(pinchHand[FINGER_TIP.index])
+    );
+
+    const width = 90, height = 14;
+    const x = p.x - width / 2;
+    const y = p.y - 55 - height / 2;
+
+    ctx.fillStyle = "rgba(0,255,102,0.15)";
+    ctx.fillRect(x, y, width, height);
+
+    ctx.fillStyle = PORTAL_COLOR;
+    ctx.fillRect(x, y, width * progress, height);
+
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = PORTAL_COLOR;
+    ctx.strokeRect(x, y, width, height);
+
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = PORTAL_COLOR;
+    ctx.stroke();
+}
+
+function toCanvasPoint(landmark) {
+    return { x: landmark.x * canvas.width, y: landmark.y * canvas.height };
+}
+
+function midpoint(a, b) {
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
 }
 
 init();
